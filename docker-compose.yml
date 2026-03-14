@@ -1,0 +1,181 @@
+version: '3.8'
+
+# ============================================================
+# DISTRIBUTED RATE LIMITER — Full Stack
+# ============================================================
+# Services:
+#   redis     - Central state store (rate limit counters)
+#   api-1/2/3 - Three stateless API instances (horizontal scale demo)
+#   nginx     - Load balancer distributes traffic across API instances
+#   prometheus - Scrapes /metrics from all API instances
+#   grafana   - Visualizes Prometheus data (dashboards)
+#
+# Run: docker-compose up -d
+# Test: curl http://localhost/api/data
+# Dashboard: http://localhost:3001 (Grafana, admin/admin)
+# Metrics: http://localhost:9090 (Prometheus)
+
+services:
+
+  # ============================================================
+  # REDIS — Central Rate Limit State Store
+  # ============================================================
+  # All API instances share this single Redis.
+  # Stateless API instances can scale freely because state is centralized here.
+  # Redis is single-threaded but extremely fast: ~100k ops/sec on modest hardware.
+  redis:
+    image: redis:7-alpine
+    container_name: rate-limiter-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    volumes:
+      - redis_data:/data
+    networks:
+      - rate-limiter-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ============================================================
+  # API INSTANCES — Stateless (key to horizontal scaling)
+  # ============================================================
+  # Three identical instances share NO state between them.
+  # All rate limit state is in Redis, so any instance can serve any request.
+  # Adding a 4th instance requires zero coordination — just add it here.
+
+  api-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rate-limiter-api-1
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_LEVEL=info
+      - INSTANCE_ID=api-1
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - rate-limiter-net
+    restart: unless-stopped
+
+  api-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rate-limiter-api-2
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_LEVEL=info
+      - INSTANCE_ID=api-2
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - rate-limiter-net
+    restart: unless-stopped
+
+  api-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rate-limiter-api-3
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_LEVEL=info
+      - INSTANCE_ID=api-3
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - rate-limiter-net
+    restart: unless-stopped
+
+  # ============================================================
+  # NGINX — Load Balancer
+  # ============================================================
+  # Distributes incoming traffic across api-1, api-2, api-3
+  # using round-robin by default.
+  # This is how "stateless services behind load balancers" works in practice.
+  nginx:
+    image: nginx:alpine
+    container_name: rate-limiter-nginx
+    ports:
+      - "80:80"       # Public HTTP port
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api-1
+      - api-2
+      - api-3
+    networks:
+      - rate-limiter-net
+    restart: unless-stopped
+
+  # ============================================================
+  # PROMETHEUS — Metrics Collection
+  # ============================================================
+  # Scrapes /metrics from all 3 API instances every 15 seconds.
+  # Stores time-series data for querying.
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rate-limiter-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+    networks:
+      - rate-limiter-net
+    restart: unless-stopped
+
+  # ============================================================
+  # GRAFANA — Monitoring Dashboard
+  # ============================================================
+  # Visualizes Prometheus data in beautiful dashboards.
+  # Access at http://localhost:3001 (admin/admin)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rate-limiter-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - rate-limiter-net
+    restart: unless-stopped
+
+networks:
+  rate-limiter-net:
+    driver: bridge
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:
